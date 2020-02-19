@@ -1,0 +1,556 @@
+```{r}
+setwd("~/Documents/R/Networks")
+library(rtweet)
+library(rtweet)
+library(readr)
+library(tidyverse)
+load("~/Documents/R/Networks/sen_friends.RData")
+load("~/Documents/R/Networks/rep_friends.RData")
+legs <- read_csv("legislators-current.csv")
+legs <- legs %>% filter(type=='sen'|type=='rep') %>% select(twitter,party,govtrack_id,type)
+legs <- na.omit(legs)
+sens <- legs %>%filter(type == 'sen') %>% select(twitter,party,govtrack_id)
+reps <- legs %>% filter(type=='rep') %>% select(twitter,party,govtrack_id)
+```
+
+Make dataframe of followers/followed
+Each row is a uni-directional follow from "follower" to "followed"
+```{r}
+senrep <- rbind(sens,reps)
+senrep_friends <-rbind(sen_friends,rep_friends)
+senrep_friends
+```
+
+Break into Republicans and Democrats (slightly more of the former than the latter)
+```{r}
+republicans <- senrep$twitter[sens$party=='Republican']
+length(republicans)
+democrats <- senrep$twitter[sens$party=='Democrat']
+length(democrats)
+```
+
+Make two graphs: one of only Democrats, one of only Republicans
+```{r}
+r_follows <- senrep_friends %>% filter(follower %in% republicans & followed %in% republicans)
+d_follows <- senrep_friends %>% filter(follower %in% democrats & followed %in% democrats)
+
+library(igraph)
+g <- graph_from_data_frame(senrep_friends, directed=TRUE)
+d <- graph_from_data_frame(d_follows, directed=TRUE,vertices=democrats)
+r <- graph_from_data_frame(r_follows, directed=TRUE,vertices=republicans)
+```
+
+Examine the edge density of Republican, Democrat, and full network
+```{r}
+edge_density(g)
+edge_density(d)
+edge_density(r)
+```
+The Democrat network is more dense than the Republican, which are both more dense than the overall network
+
+Similarly, transitivity is lower for the overall network, highest for Republican network
+```{r}
+transitivity(g)
+transitivity(d)
+transitivity(r)
+```
+
+Analyze which users are followed by the highest number of other legislators
+```{r}
+in_degree <- degree(g,mode='in')
+sort(in_degree,decreasing=TRUE)[1:10 ] #who is followed by the most people
+```
+
+```{r}
+r_follows_d <- senrep_friends %>% filter(follower %in% republicans & followed %in% democrats) 
+d_follows_r <- senrep_friends %>% filter(follower %in% democrats & followed %in% republicans)
+nrow(r_follows_d)/length(republicans) #average number of out-of-party follows for republicans
+nrow(d_follows_r)/length(democrats) #average number of out-of-party follows for democrats
+nrow(r_follows)/length(republicans) #average number of within-party follows for republicans
+nrow(d_follows)/length(democrats) #average number of within-party follows for democrats
+```
+Democrats have more out-of-party follows than Republicans, and Republicans have more within-party follows than Democrats
+
+Load tweets about Impeachment
+```{r}
+load("~/Documents/R/Networks/total_tweets_3.RData")
+impeach <- str_detect(tweets$text, regex('impeach',ignore_case=TRUE))
+impeach_tweets_full <- tweets %>% filter(impeach)
+impeach_tweets <- impeach_tweets_full %>% select(status_id,screen_name,text)
+```
+
+Make dataframe of legislators and their tweets on impeachment
+```{r}
+load("~/Documents/R/Networks/legislators.RData")
+
+names(impeach_tweets) <- c("status_id","twitter","text")
+impeach_tweets$twitter<-tolower(impeach_tweets$twitter)
+impeachment<-impeach_tweets %>% left_join(legislators,by='twitter')
+impeachment$status_id_binary <-ifelse(is.na(impeachment$status_id),0,1)
+impeachment <- impeachment %>% group_by(twitter) %>% mutate(numtweets = sum(status_id_binary)) %>% dplyr::select(twitter,party,numtweets)
+impeachment <- distinct(impeachment)
+num_tweets <- impeachment %>% dplyr::select(twitter,numtweets)
+legislators <- legislators %>% left_join(num_tweets,by='twitter')
+legislators$numtweets<-ifelse(is.na(legislators$numtweets),0,legislators$numtweets)
+
+tweet_count = impeach_tweets_full %>% dplyr::select(created_at,screen_name)
+tweet_count$screen_name<-tolower(tweet_count$screen_name)
+tweet_count$created_at<-as.Date(tweet_count$created_at)
+names(tweet_count) <- c("created_at","twitter")
+tweet_dates<-aggregate(tweet_count$created_at, list(tweet_count$twitter), paste, collapse="/")
+names(tweet_dates)<-c("twitter","dates")
+
+legislators <- legislators %>% left_join(tweet_dates,by='twitter')
+legislators
+```
+
+Make network about impeachment discussion, and interactions with other legislators on twitter
+```{r}
+df <- impeach_tweets_full
+# all mentions, as string
+mention_list <- vector("list", nrow(impeach_tweets_full))
+for(i in 1:nrow(impeach_tweets_full)){
+  mentions <- impeach_tweets_full$mentions_screen_name[i][[1]]
+  mentions <- paste(mentions,collapse=',')[[1]]
+  mention_list[[i]]<-ifelse(mentions=="NA",NA,mentions)
+}
+df$mentions <- mention_list
+df <- transform(df, mentions = as.character(mentions)) 
+df <- df %>% dplyr::select(screen_name,reply_to_screen_name,quoted_screen_name,retweet_screen_name,mentions,text,status_id,created_at)
+# all interactions as string
+df <- unite(df,interaction_name,2:5,sep=",",remove=FALSE)
+# all interactions, separate rows, edges only when interacting with other legislators
+df <- separate_rows(df,interaction_name) %>% filter(tolower(interaction_name) %in% legislators$twitter)
+df <- unique(df)
+# remove self edges
+df <- filter(df,interaction_name!=screen_name)
+
+# tweet dates, interaction types
+df$created_at<-as.Date(df$created_at)
+df$interaction_type <- ifelse(is.na(df$reply_to_screen_name),ifelse(is.na(df$quoted_screen_name),ifelse(is.na(df$retweet_screen_name),'mention','retweet'),'quote'),'reply')
+
+df$screen_name<-tolower(df$screen_name)
+df$interaction_name<-tolower(df$interaction_name)
+df <- df %>% dplyr::select(screen_name,interaction_name,text,status_id,interaction_type,created_at)
+df$created_at<-as.character(df$created_at)
+
+ntwk_graph <- graph_from_data_frame(df, directed = TRUE, vertices=legislators)
+ntwk_graph
+```
+
+Create (and optionally plot) a network of interactions restricted to a time window, and return legislators with highest eigenvector centrality
+```{r}
+timed_graph_windowed <- function(j,plot=FALSE) {
+
+upperdate = all_dates[j]
+lower_week = all_dates[j-7]
+
+#node size is proportional to the number of tweets they have on impeachment
+V(ntwk_graph)$size <- 0
+for(i in 1:length(V(ntwk_graph))){
+  tweet_dates <- V(ntwk_graph)[i]$dates
+  tweet_dates_list <- strsplit(tweet_dates,"/")
+  tweet_dates_list <- as.Date(tweet_dates_list[[1]])
+  bool_dates_list <- tweet_dates_list<upperdate
+  V(ntwk_graph)[i]$size <- sqrt(sum(bool_dates_list))*5
+}
+
+#tweets from the past week
+week_tweets <- tweet_count[tweet_count$created_at<upperdate & tweet_count$created_at>lower_week,]
+#members who tweeted this week
+week_filter <- (V(ntwk_graph)$name %in% week_tweets$twitter)
+
+#graph of vertices from this week
+g <- induced_subgraph(ntwk_graph,V(ntwk_graph)[week_filter])
+#edges from this week
+edge_filter <- E(g)$created_at>lower_week & E(g)$created_at<upperdate
+g <- delete_edges(g,E(g)[!edge_filter])
+
+#get the same layout
+l2 <- l[week_filter,]
+
+#label the legislators with the highest interactions
+node_degree <- degree(g,mode='in')
+V(g)$label<-NA
+V(g)[V(g)$name %in% names(sort(node_degree,decreasing=TRUE)[1:N])]$label <- V(g)[V(g)$name %in% names(sort(node_degree,decreasing=TRUE)[1:N])]$name
+V(g)$label.cex = .5
+
+if(plot==TRUE){
+title <- as.character(all_dates[j])
+plot(g, layout=l2,edge.arrow.size=0.01,asp=0,rescale=F,xlim = c(0, 40),
+ylim = c(0, 41),main=title)
+}
+
+ecent <- eigen_centrality(g,directed=TRUE)
+return(names(sort(ecent$vector,decreasing=TRUE)[1:3]))
+}
+```
+
+Run windowed network function for Sep-Dec of 2019
+```{r}
+startDate = as.POSIXct("2019-09-01");
+endDate = as.POSIXct("2019-12-09");
+all_dates = seq(startDate, endDate, 86400)
+N=3
+set.seed(0)
+
+l = layout.fruchterman.reingold(ntwk_graph)
+V(ntwk_graph)$label <- 1:532
+
+V(ntwk_graph)$size<-10
+V(ntwk_graph)[party == 'Republican']$color <- "red"
+V(ntwk_graph)[party == 'Republican']$frame.color <- "red"
+V(ntwk_graph)[party == 'Democrat']$color <- "dodgerblue"
+V(ntwk_graph)[party == 'Democrat']$frame.color <- "dodgerblue"
+
+evs <- c()
+for(j in seq(from=14, to=length(all_dates), by=1)){
+  ev_names <- timed_graph_windowed(j,FALSE)
+  evs <- c(evs,ev_names)
+}
+```
+
+List legislators with highest eigenvector centralities, over time
+```{r}
+top_evs <- sort(table(evs),decreasing=TRUE)[1:10]
+top_evs
+```
+
+Measure the density of the interaction graph I, and subgraphs I_R, I_D
+```{r}
+mention_graph_density <- function(j) {
+
+upperdate = all_dates[j]
+lower_week = all_dates[j-7]
+
+edge_filter <- E(ntwk_graph)$created_at>lower_week & E(ntwk_graph)$created_at<upperdate
+g<- subgraph.edges(ntwk_graph,which(edge_filter),delete.vertices=TRUE)
+g_filter <-V(ntwk_graph) %in% V(g)
+
+l2 <- l[g_filter,]
+
+full_density <- edge_density(g)
+reps <- V(g)$party=="Republican"
+dems <- V(g)$party=="Democrat"
+rep_density <- edge_density(induced_subgraph(g,V(g)[reps]))
+dem_density <- edge_density(induced_subgraph(g,V(g)[dems]))
+return(c(full_density,rep_density,dem_density))
+}
+```
+
+Calculate and plot density of interaction graph I, and subgraphs I_D, I_R, over time
+```{r}
+startDate = as.POSIXct("2019-09-06");
+endDate = as.POSIXct("2019-12-09");
+all_dates = seq(startDate, endDate, 86400)
+N=3
+set.seed(0)
+
+l = layout.fruchterman.reingold(ntwk_graph)
+V(ntwk_graph)$label <- 1:532
+
+fd <- c()
+rd <- c()
+dd <- c()
+for(j in seq(from=8, to=length(all_dates), by=1)){
+  dens <- mention_graph_density(j)
+  fd <- c(fd,dens[1])
+  rd <- c(rd,dens[2])
+  dd <- c(dd,dens[3])
+}
+
+xind = c()
+xtick = c()
+for(i in seq(from=1, to = length(fd),by=7)){
+  xind = c(xind,i)
+  xtick = c(xtick,substr(all_dates[i],6,10))
+}
+
+rd <- ifelse(is.nan(rd),0,rd)
+fd <- ifelse(is.nan(fd),0,fd)
+dd <- ifelse(is.nan(dd),0,dd)
+
+y = fd
+x = 1:length(y)
+plot(x,y,type='l',col='black',ylim=c(0, max(rd)),xaxt='n',xlab='Date (Month-Day)',ylab='Graph Density')
+axis(side=1, at=xind,labels = xtick,cex.axis=.5)
+lines(x,rd,type='l',col='red')
+lines(x,dd,type='l',col='blue')
+```
+
+Make follow dataframe and subsequent network F
+```{r}
+load("~/Documents/R/Networks/sen_friends.RData")
+load("~/Documents/R/Networks/rep_friends.RData")
+legs <- read_csv("legislators-current.csv")
+legs <- legs %>% filter(type=='sen'|type=='rep') %>% dplyr::select(twitter,party,govtrack_id,type)
+legs <- na.omit(legs)
+sens <- legs %>%filter(type == 'sen') %>% dplyr::select(twitter,party,govtrack_id)
+reps <- legs %>% filter(type=='rep') %>% dplyr::select(twitter,party,govtrack_id)
+
+senrep <- rbind(sens,reps)
+senrep_friends <-rbind(sen_friends,rep_friends)
+senrep_friends$followed<-tolower(senrep_friends$followed)
+senrep_friends$follower<-tolower(senrep_friends$follower)
+senrep$twitter <- tolower(senrep$twitter)
+senrep_friends
+
+senrep_friends2<-senrep_friends
+senrep_friends2<-senrep_friends[senrep_friends$follower!='timkaine',]
+senrep_friends2<-senrep_friends2[senrep_friends2$followed!='timkaine',]
+
+follow_ntwk <- graph_from_data_frame(senrep_friends2, directed=TRUE,vertices=legislators)
+follow_ntwk<-delete.vertices(follow_ntwk, degree(follow_ntwk)==0)
+follow_ntwk
+```
+
+Make function to restrict follow network with time window (see paper), return legislators with highest in-degree
+```{r}
+set.seed(0)
+l_follow = layout.fruchterman.reingold(follow_ntwk)
+V(follow_ntwk)[V(follow_ntwk)$party=='Democrat']$color<- "dodgerblue"
+V(follow_ntwk)[V(follow_ntwk)$party=='Republican']$color<- "red"
+V(follow_ntwk)$frame.color<-NA
+
+N=3
+
+timed_graph_follows <- function(j,plot=FALSE) {
+
+upperdate = all_dates[j]
+lower_week = all_dates[j-7]
+lower_day = all_dates[j-1]
+
+#tweets from the past week
+week_tweets <- tweet_count[(tweet_count$created_at<=upperdate & tweet_count$created_at>lower_week),]
+#all members who tweeted about impeachment in the past week 
+week_filter <- (V(follow_ntwk)$name %in% week_tweets$twitter)
+#tweets from the past day
+day_tweets <- tweet_count[(tweet_count$created_at<=upperdate & tweet_count$created_at>lower_day),]
+
+#graph of legislators who tweeted about it in the past week
+g <- induced_subgraph(follow_ntwk,V(follow_ntwk)[week_filter])
+
+#members who tweeted about impeachment in the past day
+day_filter <- (V(g)$name %in% day_tweets$twitter)
+#delete any edges not from legislators who tweeted in the past day
+g<- delete_edges(g,E(g)[!from(V(g)[day_filter])])
+
+#get the same layout
+l2 <- l_follow[week_filter,]
+
+node_degree <- degree(g,mode='in')
+V(g)$label<-NA
+
+V(g)$size<-10
+V(g)$size<-(strength(g,mode='in'))
+
+title <- as.character(all_dates[j])
+
+if(plot==TRUE){
+plot(g, layout=l2,edge.arrow.size=0.01,asp=0,rescale=F,xlim = c(min(l_follow[,1]), max(l_follow[,1])),
+ylim = c(min(l_follow[,2]), max(l_follow[,2])),main=title)
+}
+return(names(sort(node_degree,decreasing=TRUE)[1:N]))
+
+}
+```
+
+Output users with highest in-degree over time
+```{r}
+high_names <-c()
+for(i in 8:length(all_dates)){
+val <- timed_graph_follows(i,FALSE)
+high_names <- c(high_names,val)
+}
+
+top_follows <- sort(table(high_names),decreasing=TRUE)[1:10]
+top_follows
+```
+
+Collect highest impact users
+```{r}
+top_users <- c(top_evs,top_follows)
+top_users <- unique(names(top_users))
+top_users
+```
+
+Plot follow network among highest impact users
+```{r}
+set.seed(0)
+follow_ntwk <- graph_from_data_frame(senrep_friends2, directed=TRUE,vertices=legislators)
+follow_ntwk<-delete.vertices(follow_ntwk, degree(follow_ntwk)==0)
+V(follow_ntwk)[V(follow_ntwk)$party=='Democrat']$color<- "dodgerblue"
+V(follow_ntwk)[V(follow_ntwk)$party=='Republican']$color<- "red"
+V(follow_ntwk)$frame.color<-NA
+g <- induced_subgraph(follow_ntwk,V(follow_ntwk)[V(follow_ntwk)$name %in% top_users])
+
+V(g)$label<-V(g)$name
+V(g)$label.cex = .5
+
+V(g)$size<-(strength(g,mode='in'))
+plot(g, layout=layout.fruchterman.reingold(g),edge.arrow.size=.5,asp=0)
+```
+
+Plot interaction network among highest impact users
+```{r}
+g <- induced_subgraph(ntwk_graph,V(ntwk_graph)[V(ntwk_graph)$name %in% top_users])
+V(g)$label<-V(g)$name
+V(g)$label.cex = .7
+V(g)$size<-sqrt(strength(g,mode='in'))
+
+
+plot(g, layout=layout.fruchterman.reingold(g),edge.arrow.size=.1,asp=0)
+```
+
+Collect tweets from top users
+```{r}
+top_user_tweets <- impeach_tweets_full
+top_user_tweets$screen_name <- tolower(top_user_tweets$screen_name)
+top_user_tweets <- top_user_tweets %>% filter(screen_name %in% top_users)
+top_user_tweets
+```
+
+Create df of top users' twitter activity over time
+```{r}
+top_user_df <- data.frame(top_users)
+names(top_user_df)<-"screen_name"
+top_user_df$screen_name <- as.character(top_user_df$screen_name)
+
+for(j in 2:length(all_dates)){
+upperdate = all_dates[j]
+lowerdate = all_dates[j-1]
+
+#tweets from the past week
+week_tweets <- top_user_tweets[top_user_tweets$created_at<upperdate & top_user_tweets$created_at>lowerdate,]
+
+week_df <- week_tweets %>% group_by(screen_name) %>% count() %>% select(screen_name,n)
+names(week_df) <- c("screen_name",as.character(upperdate))
+top_user_df <- top_user_df %>% full_join(week_df,by='screen_name')
+
+}
+top_user_df[is.na(top_user_df)] <- 0
+
+twitter_party <- legislators %>% select(twitter,party)
+names(twitter_party)<-c("screen_name","party")
+top_user_df <- top_user_df %>% left_join(twitter_party,by='screen_name')
+top_user_df
+```
+
+Smooth and plot this data
+```{r}
+xind = c()
+xtick = c()
+for(i in seq(from=1, to = length(top_user_df),by=7)){
+  xind = c(xind,i)
+  xtick = c(xtick,substr(all_dates[i+1],6,10))
+}
+
+rep_df <- top_user_df %>% filter(party=="Republican")
+dem_df <- top_user_df %>% filter(party=="Democrat")
+rep_mean = c()
+dem_mean = c()
+for(i in 2:95){
+  rep_mean <- c(rep_mean,mean(rep_df[,i]))
+  dem_mean <- c(dem_mean,mean(dem_df[,i]))       
+}
+plot(1:length(rep_mean),rep_mean,type='l',col='red',xaxt = 'n',xlab="Date (Month-Day)", ylab="Average number of tweets on impeachment")
+axis(side=1,at=xind,labels=xtick,cex.axis=.5)
+lines(1:length(rep_mean),dem_mean,type='l',col='blue')
+
+```
+
+Plot interaction graph for a topic, colored for party and for cluster
+```{r}
+tg <-ntwk_graph
+
+E(tg)$weights<-1
+g <- delete_edge_attr(tg,"created_at")
+g <- delete_edge_attr(g,"text")
+g <- delete_edge_attr(g,"status_id")
+g <- delete_edge_attr(g,"interaction_type")
+g<- simplify(g, edge.attr.comb="sum")
+g<- delete.vertices(g, degree(g)<=1)
+g<- decompose.graph(g,max.comps=1)[[1]]
+comms <- cluster_fast_greedy(as.undirected(g))
+V(g)$group <- cutat(comms,2)
+V(g)$label<- NA
+V(g)$size<- 1
+V(g)[length(V(g))]$party = "Republican"
+V(g)[party == 'Republican']$color <- "red"
+V(g)[party == 'Republican']$frame.color <- "red"
+V(g)[party == 'Democrat']$color <- "dodgerblue"
+V(g)[party == 'Democrat']$frame.color <- "dodgerblue"
+l = layout.fruchterman.reingold(g)
+plot(g,layout = l,edge.arrow.size=0.01,asp=0)
+
+comms <- cluster_fast_greedy(as.undirected(g))
+V(g)$group <- cutat(comms,2)
+V(g)[group == 1]$color <- "black"
+V(g)[group == 2]$color <- "orange"
+V(g)$frame.color<-"black"
+V(g)[group == 2]$frame.color <- "orange"
+plot(g,layout = l,edge.arrow.size=0.01,asp=0)
+```
+
+Define the partisan number for a chosen word
+```{r}
+partisan_number <- function(chosen_word){
+  
+  impeach <- str_detect(tweets$text, regex(chosen_word,ignore_case=TRUE))
+  impeach_tweets <- tweets %>% filter(impeach)
+  
+  df <- impeach_tweets
+  # all mentions, as string
+  mention_list <- vector("list", nrow(impeach_tweets))
+  for(i in 1:nrow(impeach_tweets)){
+    mentions <- impeach_tweets$mentions_screen_name[i][[1]]
+    mentions <- paste(mentions,collapse=',')[[1]]
+    mention_list[[i]]<-ifelse(mentions=="NA",NA,mentions)
+  }
+  df$mentions <- mention_list
+  df <- transform(df, mentions = as.character(mentions)) 
+  df <- df %>% dplyr::select(screen_name,reply_to_screen_name,quoted_screen_name,retweet_screen_name,mentions,text,status_id,created_at)
+  # all interactions as string
+  df <- unite(df,interaction_name,2:5,sep=",",remove=FALSE)
+  # all interactions, separate rows, edges only when interacting with other legislators
+  df <- separate_rows(df,interaction_name) %>% filter(tolower(interaction_name) %in% legislators$twitter)
+  df <- unique(df)
+  # remove self edges
+  df <- filter(df,interaction_name!=screen_name)
+  
+  # tweet dates, interaction types
+  df$created_at<-as.Date(df$created_at)
+  df$interaction_type <- ifelse(is.na(df$reply_to_screen_name),ifelse(is.na(df$quoted_screen_name),ifelse(is.na(df$retweet_screen_name),'mention','retweet'),'quote'),'reply')
+  
+  df$screen_name<-tolower(df$screen_name)
+  df$interaction_name<-tolower(df$interaction_name)
+  df <- df %>% dplyr::select(screen_name,interaction_name,text,status_id,interaction_type,created_at)
+  #df
+  df$created_at<-as.character(df$created_at)
+  
+  ntwk_graph <- graph_from_data_frame(df, directed = TRUE, vertices=legislators)
+    
+  tg <-ntwk_graph
+  E(tg)$weights<-1
+  g <- delete_edge_attr(tg,"created_at")
+  g <- delete_edge_attr(g,"text")
+  g <- delete_edge_attr(g,"status_id")
+  g <- delete_edge_attr(g,"interaction_type")
+  g<- simplify(g, edge.attr.comb="sum")
+  g<- delete.vertices(g, degree(g)<=1)
+  g<- decompose.graph(g,max.comps=1)[[1]]
+  comms <- cluster_fast_greedy(as.undirected(g))
+  V(g)$group <- cutat(comms,2)
+  
+  group_df <- data.frame(V(g)$name,V(g)$group)
+  names(group_df)<-c("twitter","group")
+  group_df$twitter <- as.character(group_df$twitter)
+  leg_group <- legislators %>% inner_join(group_df,by='twitter')
+  
+  
+  df1 <- leg_group %>% select(party,group) %>% filter(group==1) %>% group_by(party) %>% count() %>% arrange(desc(n))
+  df2 <- leg_group %>% select(party,group) %>% filter(group==2) %>% group_by(party) %>% count() %>% arrange(desc(n))
+  return((max(df1$n)/sum(df1$n)+max(df2$n)/sum(df2$n))/2)
+}
+```
+
